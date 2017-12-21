@@ -54,6 +54,54 @@ typedef struct {
 
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io);
 
+
+static inline snd_pcm_uframes_t snd_pcm_jack_playback_avail(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+
+	/* cannot use io->hw_ptr without calling snd_pcm_avail_update()
+	 * because it is not guranteed that snd_pcm_jack_pointer() was already
+	 * called
+	 */
+	snd_pcm_sframes_t avail;
+	avail = jack->hw_ptr + io->buffer_size - io->appl_ptr;
+	if (avail < 0)
+		avail += jack->boundary;
+	else if ((snd_pcm_uframes_t) avail >= jack->boundary)
+		avail -= jack->boundary;
+	return avail;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_capture_avail(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+
+	/* cannot use io->hw_ptr without calling snd_pcm_avail_update()
+	 * because it is not guranteed that snd_pcm_jack_pointer() was already
+	 * called
+	 */
+	snd_pcm_sframes_t avail;
+	avail = jack->hw_ptr - io->appl_ptr;
+	if (avail < 0)
+		avail += jack->boundary;
+	return avail;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_avail(snd_pcm_ioplug_t *io)
+{
+	return (io->stream == SND_PCM_STREAM_PLAYBACK) ?
+	                        snd_pcm_jack_playback_avail(io) :
+	                        snd_pcm_jack_capture_avail(io);
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_hw_avail(snd_pcm_ioplug_t *io)
+{
+	/* available data/space which can be transfered by the user application */
+	const snd_pcm_uframes_t user_avail = snd_pcm_jack_avail(io);
+	/* available data/space which can be transfered by the DMA */
+	return io->buffer_size - user_avail;
+}
+
 static int pcm_poll_block_check(snd_pcm_ioplug_t *io)
 {
 	static char buf[32];
@@ -170,12 +218,20 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 			snd_pcm_uframes_t frames = nframes - xfer;
 			snd_pcm_uframes_t offset = jack->hw_ptr % io->buffer_size;
 			snd_pcm_uframes_t cont = io->buffer_size - offset;
+			snd_pcm_uframes_t hw_avail = snd_pcm_jack_hw_avail(io);
+
+			/* stop copying if there is no more data available */
+			if (hw_avail <= 0)
+				break;
 
 			/* split the snd_pcm_area_copy() function into two parts
 			 * if the data to copy passes the buffer wrap around
 			 */
 			if (cont < frames)
 				frames = cont;
+
+			if (hw_avail < frames)
+				frames = hw_avail;
 
 			for (channel = 0; channel < io->channels; channel++) {
 				if (io->stream == SND_PCM_STREAM_PLAYBACK)
