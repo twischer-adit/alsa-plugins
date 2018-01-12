@@ -20,6 +20,7 @@
  *
  */
 
+#include <stdbool.h>
 #include <byteswap.h>
 #include <sys/shm.h>
 #include <sys/types.h>
@@ -37,6 +38,7 @@ typedef struct {
 
 	int fd;
 	int activated;		/* jack is activated? */
+	volatile bool xrun_detected;
 
 	char **port_names;
 	unsigned int num_ports;
@@ -180,6 +182,17 @@ static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
 
+#ifdef TEST_SIMULATE_XRUNS
+	static int i=0;
+	if (++i > 1000) {
+		i = 0;
+		return -EPIPE;
+	}
+#endif
+
+	if (jack->xrun_detected)
+		return -EPIPE;
+
 	/* ALSA library is calulating the delta between the last pointer and
 	 * the current one.
 	 * Normally it is expecting a value between 0 and buffer_size.
@@ -274,6 +287,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		} else {
 			SNDERR("XRUN: JACK requests/provides %u frames but only %u frames were available in the ALSA buffer. (hw %u app %u)",
 			       nframes, xfer, jack->hw_ptr, io->appl_ptr);
+			jack->xrun_detected = true;
 			return 0;
 		}
 	}
@@ -291,6 +305,7 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 	int err;
 
 	jack->hw_ptr = 0;
+	jack->xrun_detected = false;
 
 	jack->min_avail = io->period_size;
 	snd_pcm_sw_params_alloca(&swparams);
