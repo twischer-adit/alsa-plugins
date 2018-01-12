@@ -41,7 +41,7 @@ typedef struct {
 	char **port_names;
 	unsigned int num_ports;
 	snd_pcm_uframes_t boundary;
-	unsigned int hw_ptr;
+	snd_pcm_uframes_t hw_ptr;
 	unsigned int sample_bits;
 	snd_pcm_uframes_t min_avail;
 
