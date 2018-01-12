@@ -249,10 +249,32 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 
 	/* check if requested frames were copied */
 	if (xfer < nframes) {
+		/* always fill the not yet written JACK buffer with silence */
 		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
 			const unsigned int samples = nframes - xfer;
 			for (channel = 0; channel < io->channels; channel++)
 				snd_pcm_area_silence(&jack->areas[channel], xfer, samples, io->format);
+		}
+
+		if (io->state == SND_PCM_STATE_PREPARED) {
+			/* After activating this JACK client with
+			 * jack_activate() this process callback will be called.
+			 * But the processing of snd_pcm_jack_start() would take
+			 * a while longer due to the jack_connect() calls.
+			 * Therefore the device was already started
+			 * but it is not yet in RUNNING state.
+			 * Due to this expected behaviour it is not a Xrun.
+			 */
+		} else if (io->state == SND_PCM_STATE_DRAINING) {
+			/* If the remaining data in the audio buffer is smaller
+			 * than the requested amount of frames
+			 * we want to provide silence to JACK.
+			 * Therefore this is also not an under run.
+			 */
+		} else {
+			SNDERR("XRUN: JACK requests/provides %u frames but only %u frames were available in the ALSA buffer. (hw %u app %u)",
+			       nframes, xfer, jack->hw_ptr, io->appl_ptr);
+			return 0;
 		}
 	}
 
