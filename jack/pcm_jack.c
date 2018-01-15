@@ -29,6 +29,17 @@
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
 
+/* ALSA supports up to 64 periods per buffer.
+ * Therefore at least 64 retries are valid and
+ * should not be handled as an error case
+ */
+#define MAX_DRAIN_RETRIES	100
+/* ALSA supports a a period with 8192 frames.
+ * This would result in ~170ms at 48kHz.
+ * Therefore a time out of 1 second is sufficient
+ */
+#define DRAIN_TIMEOUT		1000
+
 typedef enum _jack_format {
 	SND_PCM_JACK_FORMAT_RAW
 } snd_pcm_jack_format_t;
@@ -39,6 +50,7 @@ typedef struct {
 	int fd;
 	int activated;		/* jack is activated? */
 	volatile bool xrun_detected;
+	volatile bool draining;
 
 	char **port_names;
 	unsigned int num_ports;
@@ -130,7 +142,12 @@ static int pcm_poll_unblock_check(snd_pcm_ioplug_t *io)
 	snd_pcm_jack_t *jack = io->private_data;
 
 	avail = snd_pcm_avail_update(io->pcm);
-	if (avail < 0 || avail >= jack->min_avail) {
+	/* In draining state poll_fd is used to wait
+	 * till all pending frames are played.
+	 * Therefore it has to be guarantee that a poll event is also generated
+	 * if the buffer contains less than min_avail frames
+	 */
+	if (avail < 0 || avail >= jack->min_avail || jack->draining) {
 		write(jack->fd, &buf, 1);
 		return 1;
 	}
@@ -224,7 +241,9 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		jack->areas[channel].step = jack->sample_bits;
 	}
 
-	if (io->state == SND_PCM_STATE_RUNNING) {
+	if (io->state == SND_PCM_STATE_RUNNING ||
+	    io->state == SND_PCM_STATE_DRAINING ||
+	    jack->draining) {
 		const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
 
 		while (xfer < nframes) {
@@ -278,7 +297,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 			 * but it is not yet in RUNNING state.
 			 * Due to this expected behaviour it is not a Xrun.
 			 */
-		} else if (io->state == SND_PCM_STATE_DRAINING) {
+		} else if (io->state == SND_PCM_STATE_DRAINING || jack->draining) {
 			/* If the remaining data in the audio buffer is smaller
 			 * than the requested amount of frames
 			 * we want to provide silence to JACK.
@@ -380,6 +399,60 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 	return 0;
 }
 
+static int snd_pcm_jack_drain(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+	unsigned int retries = MAX_DRAIN_RETRIES;
+	char buf[32];
+
+	/* Immediately stop on capture device.
+	 * snd_pcm_jack_stop() will be automatically called
+	 * by snd_pcm_ioplug_drain()
+	 */
+	if (io->stream == SND_PCM_STREAM_CAPTURE) {
+		return 0;
+	}
+
+	if (snd_pcm_jack_hw_avail(io) <= 0) {
+		/* No data pending. Nothing to drain. */
+		return 0;
+	}
+
+	/* FIXME: io->state will not be set to SND_PCM_STATE_DRAINING by the
+	 * ALSA library before calling this function.
+	 * Therefore this state has to be stored internally.
+	 */
+	jack->draining = true;
+
+	/* start device if not yet done */
+	if (!jack->activated) {
+		snd_pcm_jack_start(io);
+	}
+
+	struct pollfd pfd;
+	pfd.fd = io->poll_fd;
+	pfd.events = io->poll_events | POLLERR | POLLNVAL;
+
+	while (snd_pcm_jack_hw_avail(io) > 0) {
+		if (retries <= 0) {
+			SNDERR("Pending frames not yet processed.");
+			return -ETIMEDOUT;
+		}
+
+		if (poll(&pfd, 1, DRAIN_TIMEOUT) < 0) {
+			SNDERR("Waiting for next JACK process callback failed (err %d)",
+			       -errno);
+			return -errno;
+		}
+
+		/* clean pending events. */
+		while (read(io->poll_fd, &buf, sizeof(buf)) == sizeof(buf))
+			;
+	}
+
+	return 0;
+}
+
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
@@ -388,6 +461,8 @@ static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io)
 		jack_deactivate(jack->client);
 		jack->activated = 0;
 	}
+
+	jack->draining = false;
 #if 0
 	unsigned i;
 	for (i = 0; i < io->channels; i++) {
@@ -406,6 +481,7 @@ static snd_pcm_ioplug_callback_t jack_pcm_callback = {
 	.stop = snd_pcm_jack_stop,
 	.pointer = snd_pcm_jack_pointer,
 	.prepare = snd_pcm_jack_prepare,
+	.drain = snd_pcm_jack_drain,
 	.poll_revents = snd_pcm_jack_poll_revents,
 };
 
