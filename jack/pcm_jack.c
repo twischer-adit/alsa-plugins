@@ -93,7 +93,7 @@ typedef struct {
 	 * not changed by the ALSA thread as long as the JACK thread is active.
 	 * Therefore no locking is required.
 	 */
-	snd_pcm_channel_area_t *areas;
+	snd_pcm_channel_area_t *jack_areas;
 	jack_port_t **ports;
 } snd_pcm_jack_t;
 
@@ -203,7 +203,7 @@ static void snd_pcm_jack_free(snd_pcm_jack_t *jack)
 			close(jack->fd);
 		if (jack->io.poll_fd >= 0)
 			close(jack->io.poll_fd);
-		free(jack->areas);
+		free(jack->jack_areas);
 		free(jack->ports);
 		free(jack);
 	}
@@ -286,10 +286,10 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 	snd_pcm_state_t state;
 	
 	for (channel = 0; channel < io->channels; channel++) {
-		jack->areas[channel].addr = 
+		jack->jack_areas[channel].addr =
 			jack_port_get_buffer (jack->ports[channel], nframes);
-		jack->areas[channel].first = 0;
-		jack->areas[channel].step = jack->sample_bits;
+		jack->jack_areas[channel].first = 0;
+		jack->jack_areas[channel].step = jack->sample_bits;
 	}
 
 	state = ATOMIC_READ(&jack->state);
@@ -320,9 +320,9 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 
 			for (channel = 0; channel < io->channels; channel++) {
 				if (io->stream == SND_PCM_STREAM_PLAYBACK)
-					snd_pcm_area_copy(&jack->areas[channel], xfer, &alsa_areas[channel], offset, frames, io->format);
+					snd_pcm_area_copy(&jack->jack_areas[channel], xfer, &alsa_areas[channel], offset, frames, io->format);
 				else
-					snd_pcm_area_copy(&alsa_areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
+					snd_pcm_area_copy(&alsa_areas[channel], offset, &jack->jack_areas[channel], xfer, frames, io->format);
 			}
 
 			hw_ptr += frames;
@@ -339,7 +339,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
 			const unsigned int samples = nframes - xfer;
 			for (channel = 0; channel < io->channels; channel++)
-				snd_pcm_area_silence(&jack->areas[channel], xfer, samples, io->format);
+				snd_pcm_area_silence(&jack->jack_areas[channel], xfer, samples, io->format);
 		}
 
 		if (state == SND_PCM_STATE_PREPARED) {
@@ -689,8 +689,8 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 		return -ENOENT;
 	}
 
-	jack->areas = calloc(jack->channels, sizeof(snd_pcm_channel_area_t));
-	if (! jack->areas) {
+	jack->jack_areas = calloc(jack->channels, sizeof(snd_pcm_channel_area_t));
+	if (! jack->jack_areas) {
 		snd_pcm_jack_free(jack);
 		return -ENOMEM;
 	}
