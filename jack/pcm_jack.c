@@ -46,6 +46,7 @@
 #include <stdatomic.h>
 #define ATOMIC_WRITE(VARP, VAL)    atomic_store((VARP), (VAL))
 #define ATOMIC_READ(VARP)          atomic_load((VARP))
+typedef _Atomic snd_pcm_state_t    atomic_snd_pcm_state_t;
 typedef _Atomic snd_pcm_uframes_t  atomic_snd_pcm_uframes_t;
 
 #else
@@ -54,6 +55,7 @@ typedef _Atomic snd_pcm_uframes_t  atomic_snd_pcm_uframes_t;
 #define ATOMIC_READ(VARP)          __sync_fetch_and_or((VARP), 0)
 
 typedef volatile int               atomic_bool;
+typedef volatile snd_pcm_state_t   atomic_snd_pcm_state_t;
 typedef volatile snd_pcm_uframes_t atomic_snd_pcm_uframes_t;
 #endif
 
@@ -66,8 +68,6 @@ typedef struct {
 	snd_pcm_ioplug_t io;
 
 	int fd;
-	int activated;		/* jack is activated? */
-	volatile bool draining;
 
 	char **port_names;
 	unsigned int num_ports;
@@ -79,6 +79,7 @@ typedef struct {
 	jack_client_t *client;
 
 	/* variables used by ALSA and JACK thread */
+	atomic_snd_pcm_state_t state;
 	atomic_snd_pcm_uframes_t hw_ptr;
 	atomic_bool xrun_detected;
 
@@ -172,7 +173,8 @@ static int pcm_poll_unblock_check(snd_pcm_ioplug_t *io)
 	 * Therefore it has to be guarantee that a poll event is also generated
 	 * if the buffer contains less than min_avail frames
 	 */
-	if (avail < 0 || avail >= jack->min_avail || jack->draining) {
+	if (avail < 0 || avail >= jack->min_avail ||
+	    ATOMIC_READ(&jack->state) == SND_PCM_STATE_DRAINING) {
 		write(jack->fd, &buf, 1);
 		return 1;
 	}
@@ -258,6 +260,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 	snd_pcm_jack_t *jack = io->private_data;
 	snd_pcm_uframes_t xfer = 0;
 	unsigned int channel;
+	snd_pcm_state_t state;
 	
 	for (channel = 0; channel < io->channels; channel++) {
 		jack->areas[channel].addr = 
@@ -266,9 +269,9 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		jack->areas[channel].step = jack->sample_bits;
 	}
 
-	if (io->state == SND_PCM_STATE_RUNNING ||
-	    io->state == SND_PCM_STATE_DRAINING ||
-	    jack->draining) {
+	state = ATOMIC_READ(&jack->state);
+	if (state == SND_PCM_STATE_RUNNING ||
+	    state == SND_PCM_STATE_DRAINING) {
 		const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
 
 		while (xfer < nframes) {
@@ -315,7 +318,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 				snd_pcm_area_silence(&jack->areas[channel], xfer, samples, io->format);
 		}
 
-		if (io->state == SND_PCM_STATE_PREPARED) {
+		if (state == SND_PCM_STATE_PREPARED) {
 			/* After activating this JACK client with
 			 * jack_activate() this process callback will be called.
 			 * But the processing of snd_pcm_jack_start() would take
@@ -324,7 +327,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 			 * but it is not yet in RUNNING state.
 			 * Due to this expected behaviour it is not a Xrun.
 			 */
-		} else if (io->state == SND_PCM_STATE_DRAINING || jack->draining) {
+		} else if (state == SND_PCM_STATE_DRAINING) {
 			/* If the remaining data in the audio buffer is smaller
 			 * than the requested amount of frames
 			 * we want to provide silence to JACK.
@@ -393,6 +396,9 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 
 	jack_set_process_callback(jack->client,
 				  (JackProcessCallback)snd_pcm_jack_process_cb, io);
+
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_PREPARED);
+
 	return 0;
 }
 
@@ -403,8 +409,6 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 	
 	if (jack_activate (jack->client))
 		return -EIO;
-
-	jack->activated = 1;
 
 	for (i = 0; i < io->channels && i < jack->num_ports; i++) {
 		if (jack->port_names[i]) {
@@ -422,6 +426,13 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 			}
 		}
 	}
+
+	/* Do not change back to running if we are already in draining.
+	 * This can happen when the playback was not yet started
+	 * but the stream will be stopped with snd_pcm_drain()
+	 */
+	if (ATOMIC_READ(&jack->state) != SND_PCM_STATE_DRAINING)
+		ATOMIC_WRITE(&jack->state, SND_PCM_STATE_RUNNING);
 	
 	return 0;
 }
@@ -429,6 +440,7 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 static int snd_pcm_jack_drain(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
+	snd_pcm_state_t state;
 	unsigned int retries = MAX_DRAIN_RETRIES;
 	char buf[32];
 
@@ -449,10 +461,11 @@ static int snd_pcm_jack_drain(snd_pcm_ioplug_t *io)
 	 * ALSA library before calling this function.
 	 * Therefore this state has to be stored internally.
 	 */
-	jack->draining = true;
+	state = ATOMIC_READ(&jack->state);
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_DRAINING);
 
 	/* start device if not yet done */
-	if (!jack->activated) {
+	if (state != SND_PCM_STATE_RUNNING) {
 		snd_pcm_jack_start(io);
 	}
 
@@ -483,13 +496,14 @@ static int snd_pcm_jack_drain(snd_pcm_ioplug_t *io)
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
-	
-	if (jack->activated) {
+	const snd_pcm_state_t state = ATOMIC_READ(&jack->state);
+
+	if (state == SND_PCM_STATE_RUNNING ||
+	    state == SND_PCM_STATE_DRAINING) {
 		jack_deactivate(jack->client);
-		jack->activated = 0;
 	}
 
-	jack->draining = false;
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_SETUP);
 #if 0
 	unsigned i;
 	for (i = 0; i < io->channels; i++) {
@@ -611,6 +625,7 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 
 	jack->fd = -1;
 	jack->io.poll_fd = -1;
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_OPEN);
 
 	err = parse_ports(jack, stream == SND_PCM_STREAM_PLAYBACK ?
 			  playback_conf : capture_conf);
