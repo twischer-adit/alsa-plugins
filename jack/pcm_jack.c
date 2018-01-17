@@ -48,6 +48,7 @@
 #define ATOMIC_READ(VARP)          atomic_load((VARP))
 typedef _Atomic snd_pcm_state_t    atomic_snd_pcm_state_t;
 typedef _Atomic snd_pcm_uframes_t  atomic_snd_pcm_uframes_t;
+typedef _Atomic snd_pcm_channel_area_t atomic_snd_pcm_channel_area_t;
 
 #else
 #define ATOMIC_WRITE(VARP, VAL) \
@@ -57,6 +58,7 @@ typedef _Atomic snd_pcm_uframes_t  atomic_snd_pcm_uframes_t;
 typedef volatile int               atomic_bool;
 typedef volatile snd_pcm_state_t   atomic_snd_pcm_state_t;
 typedef volatile snd_pcm_uframes_t atomic_snd_pcm_uframes_t;
+typedef volatile snd_pcm_channel_area_t atomic_snd_pcm_channel_area_t;
 #endif
 
 
@@ -82,6 +84,8 @@ typedef struct {
 	atomic_snd_pcm_state_t state;
 	atomic_snd_pcm_uframes_t appl_ptr;
 	atomic_snd_pcm_uframes_t hw_ptr;
+	/** the areas provided by the ALSA library from the user application */
+	const atomic_snd_pcm_channel_area_t *alsa_areas;
 	atomic_bool xrun_detected;
 
 	/* variables used by JACK thread
@@ -268,6 +272,7 @@ static snd_pcm_sframes_t snd_pcm_jack_transfer(snd_pcm_ioplug_t *io,
 	 */
 	const snd_pcm_uframes_t forwarded_appl_ptr = io->appl_ptr + size;
 	ATOMIC_WRITE(&jack->appl_ptr, forwarded_appl_ptr);
+	ATOMIC_WRITE(&(jack->alsa_areas), (atomic_snd_pcm_channel_area_t*)areas);
 
 	return size;
 }
@@ -290,7 +295,8 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 	state = ATOMIC_READ(&jack->state);
 	if (state == SND_PCM_STATE_RUNNING ||
 	    state == SND_PCM_STATE_DRAINING) {
-		const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
+		const snd_pcm_channel_area_t *alsa_areas =
+		                (snd_pcm_channel_area_t*)ATOMIC_READ(&jack->alsa_areas);
 
 		while (xfer < nframes) {
 			snd_pcm_uframes_t frames = nframes - xfer;
@@ -314,9 +320,9 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 
 			for (channel = 0; channel < io->channels; channel++) {
 				if (io->stream == SND_PCM_STREAM_PLAYBACK)
-					snd_pcm_area_copy(&jack->areas[channel], xfer, &areas[channel], offset, frames, io->format);
+					snd_pcm_area_copy(&jack->areas[channel], xfer, &alsa_areas[channel], offset, frames, io->format);
 				else
-					snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
+					snd_pcm_area_copy(&alsa_areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
 			}
 
 			hw_ptr += frames;
