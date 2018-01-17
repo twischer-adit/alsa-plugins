@@ -80,6 +80,7 @@ typedef struct {
 
 	/* variables used by ALSA and JACK thread */
 	atomic_snd_pcm_state_t state;
+	atomic_snd_pcm_uframes_t appl_ptr;
 	atomic_snd_pcm_uframes_t hw_ptr;
 	atomic_bool xrun_detected;
 
@@ -104,7 +105,8 @@ static inline snd_pcm_uframes_t snd_pcm_jack_playback_avail(snd_pcm_ioplug_t *io
 	 * called
 	 */
 	snd_pcm_sframes_t avail;
-	avail = ATOMIC_READ(&jack->hw_ptr) + io->buffer_size - io->appl_ptr;
+	avail = ATOMIC_READ(&jack->hw_ptr) + io->buffer_size -
+	        ATOMIC_READ(&jack->appl_ptr);
 	if (avail < 0)
 		avail += jack->boundary;
 	else if ((snd_pcm_uframes_t) avail >= jack->boundary)
@@ -121,7 +123,7 @@ static inline snd_pcm_uframes_t snd_pcm_jack_capture_avail(snd_pcm_ioplug_t *io)
 	 * called
 	 */
 	snd_pcm_sframes_t avail;
-	avail = ATOMIC_READ(&jack->hw_ptr) - io->appl_ptr;
+	avail = ATOMIC_READ(&jack->hw_ptr) - ATOMIC_READ(&jack->appl_ptr);
 	if (avail < 0)
 		avail += jack->boundary;
 	return avail;
@@ -254,6 +256,22 @@ static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 	return ATOMIC_READ(&jack->hw_ptr);
 }
 
+static snd_pcm_sframes_t snd_pcm_jack_transfer(snd_pcm_ioplug_t *io,
+                                               const snd_pcm_channel_area_t *areas,
+                                               snd_pcm_uframes_t offset,
+                                               snd_pcm_uframes_t size)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+
+	/* The application pointer will be updated after calling the transfer
+	 * function therefore we have to add the size here
+	 */
+	const snd_pcm_uframes_t forwarded_appl_ptr = io->appl_ptr + size;
+	ATOMIC_WRITE(&jack->appl_ptr, forwarded_appl_ptr);
+
+	return size;
+}
+
 static int
 snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 {
@@ -335,7 +353,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 			 */
 		} else {
 			SNDERR("XRUN: JACK requests/provides %u frames but only %u frames were available in the ALSA buffer. (hw %u app %u)",
-			       nframes, xfer, jack->hw_ptr, io->appl_ptr);
+			       nframes, xfer, jack->hw_ptr, jack->appl_ptr);
 			ATOMIC_WRITE(&jack->xrun_detected, false);
 			return 0;
 		}
@@ -353,6 +371,7 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 	snd_pcm_sw_params_t *swparams;
 	int err;
 
+	ATOMIC_WRITE(&jack->appl_ptr, 0);
 	ATOMIC_WRITE(&jack->hw_ptr, 0);
 	ATOMIC_WRITE(&jack->xrun_detected, false);
 
@@ -521,6 +540,7 @@ static snd_pcm_ioplug_callback_t jack_pcm_callback = {
 	.start = snd_pcm_jack_start,
 	.stop = snd_pcm_jack_stop,
 	.pointer = snd_pcm_jack_pointer,
+	.transfer = snd_pcm_jack_transfer,
 	.prepare = snd_pcm_jack_prepare,
 	.drain = snd_pcm_jack_drain,
 	.poll_revents = snd_pcm_jack_poll_revents,
