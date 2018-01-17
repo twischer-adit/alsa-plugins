@@ -198,6 +198,17 @@ static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
 
+#ifdef TEST_SIMULATE_XRUNS
+	static int i=0;
+	if (++i > 1000) {
+		i = 0;
+		return -EPIPE;
+	}
+#endif
+
+	if (jack->state == SND_PCM_STATE_XRUN)
+		return -EPIPE;
+
 #ifdef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
 	return jack->hw_ptr;
 #else
@@ -267,6 +278,25 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 			const snd_pcm_uframes_t samples = nframes - xfer;
 			for (channel = 0; channel < io->channels; channel++)
 				snd_pcm_area_silence(&jack->areas[channel], xfer, samples, io->format);
+		}
+
+		if (io->stream == SND_PCM_STREAM_PLAYBACK &&
+		    jack->state == SND_PCM_STATE_PREPARED) {
+			/* After activating this JACK client with
+			 * jack_activate() this process callback will be called.
+			 * But the processing of snd_pcm_jack_start() would take
+			 * a while longer due to the jack_connect() calls.
+			 * Therefore the device was already started
+			 * but it is not yet in RUNNING state.
+			 * Due to this expected behaviour it is not an under run.
+			 * In Capture use case the buffer should be filled
+			 * and if the application is not fast enough
+			 * to read the data in the buffer
+			 * it is a valid over run.
+			 */
+		} else {
+			/* report Xrun to user application */
+			jack->state = SND_PCM_STATE_XRUN;
 		}
 	}
 
