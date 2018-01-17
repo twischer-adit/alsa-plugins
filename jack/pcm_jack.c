@@ -147,35 +147,38 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		jack->areas[channel].first = 0;
 		jack->areas[channel].step = jack->sample_bits;
 	}
-		
-	if (io->state != SND_PCM_STATE_RUNNING) {
-		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
-			for (channel = 0; channel < io->channels; channel++)
-				snd_pcm_area_silence(&jack->areas[channel], 0, nframes, io->format);
-			return 0;
+
+	if (io->state == SND_PCM_STATE_RUNNING) {
+		areas = snd_pcm_ioplug_mmap_areas(io);
+
+		while (xfer < nframes) {
+			snd_pcm_uframes_t frames = nframes - xfer;
+			snd_pcm_uframes_t offset = jack->hw_ptr;
+			snd_pcm_uframes_t cont = io->buffer_size - offset;
+
+			if (cont < frames)
+				frames = cont;
+
+			for (channel = 0; channel < io->channels; channel++) {
+				if (io->stream == SND_PCM_STREAM_PLAYBACK)
+					snd_pcm_area_copy(&jack->areas[channel], xfer, &areas[channel], offset, frames, io->format);
+				else
+					snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
+			}
+
+			jack->hw_ptr += frames;
+			jack->hw_ptr %= io->buffer_size;
+			xfer += frames;
 		}
 	}
-	
-	areas = snd_pcm_ioplug_mmap_areas(io);
 
-	while (xfer < nframes) {
-		snd_pcm_uframes_t frames = nframes - xfer;
-		snd_pcm_uframes_t offset = jack->hw_ptr;
-		snd_pcm_uframes_t cont = io->buffer_size - offset;
-
-		if (cont < frames)
-			frames = cont;
-
-		for (channel = 0; channel < io->channels; channel++) {
-			if (io->stream == SND_PCM_STREAM_PLAYBACK)
-				snd_pcm_area_copy(&jack->areas[channel], xfer, &areas[channel], offset, frames, io->format);
-			else
-				snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
+	/* check if requested frames were copied */
+	if (xfer < nframes) {
+		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+			const unsigned int samples = nframes - xfer;
+			for (channel = 0; channel < io->channels; channel++)
+				snd_pcm_area_silence(&jack->areas[channel], xfer, samples, io->format);
 		}
-		
-		jack->hw_ptr += frames;
-		jack->hw_ptr %= io->buffer_size;
-		xfer += frames;
 	}
 
 	pcm_poll_unblock_check(io); /* unblock socket for polling if needed */
