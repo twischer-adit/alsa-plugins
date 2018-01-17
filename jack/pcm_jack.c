@@ -40,6 +40,24 @@
  */
 #define DRAIN_TIMEOUT		1000
 
+
+/* All these atomic instructions include a full memory barrier */
+#ifndef __STDC_NO_ATOMICS__
+#include <stdatomic.h>
+#define ATOMIC_WRITE(VARP, VAL)    atomic_store((VARP), (VAL))
+#define ATOMIC_READ(VARP)          atomic_load((VARP))
+typedef _Atomic snd_pcm_uframes_t  atomic_snd_pcm_uframes_t;
+
+#else
+#define ATOMIC_WRITE(VARP, VAL) \
+	while ( !__sync_bool_compare_and_swap((VARP), *(VARP), (VAL)) );
+#define ATOMIC_READ(VARP)          __sync_fetch_and_or((VARP), 0)
+
+typedef volatile int               atomic_bool;
+typedef volatile snd_pcm_uframes_t atomic_snd_pcm_uframes_t;
+#endif
+
+
 typedef enum _jack_format {
 	SND_PCM_JACK_FORMAT_RAW
 } snd_pcm_jack_format_t;
@@ -49,21 +67,28 @@ typedef struct {
 
 	int fd;
 	int activated;		/* jack is activated? */
-	volatile bool xrun_detected;
 	volatile bool draining;
 
 	char **port_names;
 	unsigned int num_ports;
 	snd_pcm_uframes_t boundary;
-	snd_pcm_uframes_t hw_ptr;
 	unsigned int sample_bits;
 	snd_pcm_uframes_t min_avail;
 
 	unsigned int channels;
-	snd_pcm_channel_area_t *areas;
-
-	jack_port_t **ports;
 	jack_client_t *client;
+
+	/* variables used by ALSA and JACK thread */
+	atomic_snd_pcm_uframes_t hw_ptr;
+	atomic_bool xrun_detected;
+
+	/* variables used by JACK thread
+	 * They will be initialized before the JACK thread was started and
+	 * not changed by the ALSA thread as long as the JACK thread is active.
+	 * Therefore no locking is required.
+	 */
+	snd_pcm_channel_area_t *areas;
+	jack_port_t **ports;
 } snd_pcm_jack_t;
 
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io);
@@ -78,7 +103,7 @@ static inline snd_pcm_uframes_t snd_pcm_jack_playback_avail(snd_pcm_ioplug_t *io
 	 * called
 	 */
 	snd_pcm_sframes_t avail;
-	avail = jack->hw_ptr + io->buffer_size - io->appl_ptr;
+	avail = ATOMIC_READ(&jack->hw_ptr) + io->buffer_size - io->appl_ptr;
 	if (avail < 0)
 		avail += jack->boundary;
 	else if ((snd_pcm_uframes_t) avail >= jack->boundary)
@@ -95,7 +120,7 @@ static inline snd_pcm_uframes_t snd_pcm_jack_capture_avail(snd_pcm_ioplug_t *io)
 	 * called
 	 */
 	snd_pcm_sframes_t avail;
-	avail = jack->hw_ptr - io->appl_ptr;
+	avail = ATOMIC_READ(&jack->hw_ptr) - io->appl_ptr;
 	if (avail < 0)
 		avail += jack->boundary;
 	return avail;
@@ -207,7 +232,7 @@ static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 	}
 #endif
 
-	if (jack->xrun_detected)
+	if ( ATOMIC_READ(&jack->xrun_detected) )
 		return -EPIPE;
 
 	/* ALSA library is calulating the delta between the last pointer and
@@ -224,7 +249,7 @@ static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 	 * would not be recognized by the ALSA library.
 	 * Therefore we are using jack->boundary as the wrap around.
 	 */
-	return jack->hw_ptr;
+	return ATOMIC_READ(&jack->hw_ptr);
 }
 
 static int
@@ -248,7 +273,8 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 
 		while (xfer < nframes) {
 			snd_pcm_uframes_t frames = nframes - xfer;
-			snd_pcm_uframes_t offset = jack->hw_ptr % io->buffer_size;
+			snd_pcm_uframes_t hw_ptr = ATOMIC_READ(&jack->hw_ptr);
+			snd_pcm_uframes_t offset = hw_ptr % io->buffer_size;
 			snd_pcm_uframes_t cont = io->buffer_size - offset;
 			snd_pcm_uframes_t hw_avail = snd_pcm_jack_hw_avail(io);
 
@@ -272,9 +298,10 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 					snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
 			}
 
-			jack->hw_ptr += frames;
-			if (jack->hw_ptr >= jack->boundary)
-				jack->hw_ptr -= jack->boundary;
+			hw_ptr += frames;
+			if (hw_ptr >= jack->boundary)
+				hw_ptr -= jack->boundary;
+			ATOMIC_WRITE(&jack->hw_ptr, hw_ptr);
 			xfer += frames;
 		}
 	}
@@ -306,7 +333,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		} else {
 			SNDERR("XRUN: JACK requests/provides %u frames but only %u frames were available in the ALSA buffer. (hw %u app %u)",
 			       nframes, xfer, jack->hw_ptr, io->appl_ptr);
-			jack->xrun_detected = true;
+			ATOMIC_WRITE(&jack->xrun_detected, false);
 			return 0;
 		}
 	}
@@ -323,8 +350,8 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 	snd_pcm_sw_params_t *swparams;
 	int err;
 
-	jack->hw_ptr = 0;
-	jack->xrun_detected = false;
+	ATOMIC_WRITE(&jack->hw_ptr, 0);
+	ATOMIC_WRITE(&jack->xrun_detected, false);
 
 	jack->min_avail = io->period_size;
 	snd_pcm_sw_params_alloca(&swparams);
