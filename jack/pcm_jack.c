@@ -20,6 +20,7 @@
  *
  */
 
+#include <stdbool.h>
 #include <byteswap.h>
 #include <sys/shm.h>
 #include <sys/types.h>
@@ -27,6 +28,39 @@
 #include <jack/jack.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+
+/* ALSA supports up to 64 periods per buffer.
+ * Therefore at least 64 retries are valid and
+ * should not be handled as an error case
+ */
+#define MAX_DRAIN_RETRIES	100
+/* ALSA supports a a period with 8192 frames.
+ * This would result in ~170ms at 48kHz.
+ * Therefore a time out of 1 second is sufficient
+ */
+#define DRAIN_TIMEOUT		1000
+
+
+/* All these atomic instructions include a full memory barrier */
+#ifndef __STDC_NO_ATOMICS__
+#include <stdatomic.h>
+#define ATOMIC_WRITE(VARP, VAL)    atomic_store((VARP), (VAL))
+#define ATOMIC_READ(VARP)          atomic_load((VARP))
+typedef _Atomic snd_pcm_state_t    atomic_snd_pcm_state_t;
+typedef _Atomic snd_pcm_uframes_t  atomic_snd_pcm_uframes_t;
+typedef _Atomic snd_pcm_channel_area_t atomic_snd_pcm_channel_area_t;
+
+#else
+#define ATOMIC_WRITE(VARP, VAL) \
+	while ( !__sync_bool_compare_and_swap((VARP), *(VARP), (VAL)) );
+#define ATOMIC_READ(VARP)          __sync_fetch_and_or((VARP), 0)
+
+typedef volatile int               atomic_bool;
+typedef volatile snd_pcm_state_t   atomic_snd_pcm_state_t;
+typedef volatile snd_pcm_uframes_t atomic_snd_pcm_uframes_t;
+typedef volatile snd_pcm_channel_area_t atomic_snd_pcm_channel_area_t;
+#endif
+
 
 typedef enum _jack_format {
 	SND_PCM_JACK_FORMAT_RAW
@@ -36,22 +70,83 @@ typedef struct {
 	snd_pcm_ioplug_t io;
 
 	int fd;
-	int activated;		/* jack is activated? */
 
 	char **port_names;
 	unsigned int num_ports;
-	unsigned int hw_ptr;
+	snd_pcm_uframes_t boundary;
 	unsigned int sample_bits;
 	snd_pcm_uframes_t min_avail;
 
 	unsigned int channels;
-	snd_pcm_channel_area_t *areas;
-
-	jack_port_t **ports;
 	jack_client_t *client;
+
+	/* variables used by ALSA and JACK thread */
+	atomic_snd_pcm_state_t state;
+	atomic_snd_pcm_uframes_t appl_ptr;
+	atomic_snd_pcm_uframes_t hw_ptr;
+	/** the areas provided by the ALSA library from the user application */
+	const atomic_snd_pcm_channel_area_t *alsa_areas;
+	atomic_bool xrun_detected;
+
+	/* variables used by JACK thread
+	 * They will be initialized before the JACK thread was started and
+	 * not changed by the ALSA thread as long as the JACK thread is active.
+	 * Therefore no locking is required.
+	 */
+	snd_pcm_channel_area_t *jack_areas;
+	jack_port_t **ports;
 } snd_pcm_jack_t;
 
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io);
+
+
+static inline snd_pcm_uframes_t snd_pcm_jack_playback_avail(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+
+	/* cannot use io->hw_ptr without calling snd_pcm_avail_update()
+	 * because it is not guranteed that snd_pcm_jack_pointer() was already
+	 * called
+	 */
+	snd_pcm_sframes_t avail;
+	avail = ATOMIC_READ(&jack->hw_ptr) + io->buffer_size -
+	        ATOMIC_READ(&jack->appl_ptr);
+	if (avail < 0)
+		avail += jack->boundary;
+	else if ((snd_pcm_uframes_t) avail >= jack->boundary)
+		avail -= jack->boundary;
+	return avail;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_capture_avail(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+
+	/* cannot use io->hw_ptr without calling snd_pcm_avail_update()
+	 * because it is not guranteed that snd_pcm_jack_pointer() was already
+	 * called
+	 */
+	snd_pcm_sframes_t avail;
+	avail = ATOMIC_READ(&jack->hw_ptr) - ATOMIC_READ(&jack->appl_ptr);
+	if (avail < 0)
+		avail += jack->boundary;
+	return avail;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_avail(snd_pcm_ioplug_t *io)
+{
+	return (io->stream == SND_PCM_STREAM_PLAYBACK) ?
+	                        snd_pcm_jack_playback_avail(io) :
+	                        snd_pcm_jack_capture_avail(io);
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_hw_avail(snd_pcm_ioplug_t *io)
+{
+	/* available data/space which can be transfered by the user application */
+	const snd_pcm_uframes_t user_avail = snd_pcm_jack_avail(io);
+	/* available data/space which can be transfered by the DMA */
+	return io->buffer_size - user_avail;
+}
 
 static int pcm_poll_block_check(snd_pcm_ioplug_t *io)
 {
@@ -61,7 +156,7 @@ static int pcm_poll_block_check(snd_pcm_ioplug_t *io)
 
 	if (io->state == SND_PCM_STATE_RUNNING ||
 	    (io->state == SND_PCM_STATE_PREPARED && io->stream == SND_PCM_STREAM_CAPTURE)) {
-		avail = snd_pcm_avail_update(io->pcm);
+		avail = snd_pcm_jack_avail(io);
 		if (avail >= 0 && avail < jack->min_avail) {
 			while (read(io->poll_fd, &buf, sizeof(buf)) == sizeof(buf))
 				;
@@ -78,8 +173,14 @@ static int pcm_poll_unblock_check(snd_pcm_ioplug_t *io)
 	snd_pcm_sframes_t avail;
 	snd_pcm_jack_t *jack = io->private_data;
 
-	avail = snd_pcm_avail_update(io->pcm);
-	if (avail < 0 || avail >= jack->min_avail) {
+	avail = snd_pcm_jack_avail(io);
+	/* In draining state poll_fd is used to wait
+	 * till all pending frames are played.
+	 * Therefore it has to be guarantee that a poll event is also generated
+	 * if the buffer contains less than min_avail frames
+	 */
+	if (avail < 0 || avail >= jack->min_avail ||
+	    ATOMIC_READ(&jack->state) == SND_PCM_STATE_DRAINING) {
 		write(jack->fd, &buf, 1);
 		return 1;
 	}
@@ -102,7 +203,7 @@ static void snd_pcm_jack_free(snd_pcm_jack_t *jack)
 			close(jack->fd);
 		if (jack->io.poll_fd >= 0)
 			close(jack->io.poll_fd);
-		free(jack->areas);
+		free(jack->jack_areas);
 		free(jack->ports);
 		free(jack);
 	}
@@ -130,52 +231,138 @@ static int snd_pcm_jack_poll_revents(snd_pcm_ioplug_t *io,
 static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
-	return jack->hw_ptr;
+
+#ifdef TEST_SIMULATE_XRUNS
+	static int i=0;
+	if (++i > 1000) {
+		i = 0;
+		return -EPIPE;
+	}
+#endif
+
+	if ( ATOMIC_READ(&jack->xrun_detected) )
+		return -EPIPE;
+
+	/* ALSA library is calulating the delta between the last pointer and
+	 * the current one.
+	 * Normally it is expecting a value between 0 and buffer_size.
+	 * The following example would result in an negative delta
+	 * which would result in a hw_ptr which will be reduced.
+	 *  last_hw = jack->boundary - io->buffer_size
+	 *  hw = 0
+	 * But we cannot use
+	 * return jack->hw_ptr % io->buffer_size;
+	 * because in this case an update of
+	 * hw_ptr += io->buffer_size
+	 * would not be recognized by the ALSA library.
+	 * Therefore we are using jack->boundary as the wrap around.
+	 */
+	return ATOMIC_READ(&jack->hw_ptr);
+}
+
+static snd_pcm_sframes_t snd_pcm_jack_transfer(snd_pcm_ioplug_t *io,
+                                               const snd_pcm_channel_area_t *areas,
+                                               snd_pcm_uframes_t offset,
+                                               snd_pcm_uframes_t size)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+
+	/* The application pointer will be updated after calling the transfer
+	 * function therefore we have to add the size here
+	 */
+	const snd_pcm_uframes_t forwarded_appl_ptr = io->appl_ptr + size;
+	ATOMIC_WRITE(&jack->appl_ptr, forwarded_appl_ptr);
+	ATOMIC_WRITE(&(jack->alsa_areas), (atomic_snd_pcm_channel_area_t*)areas);
+
+	return size;
 }
 
 static int
 snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
-	const snd_pcm_channel_area_t *areas;
 	snd_pcm_uframes_t xfer = 0;
 	unsigned int channel;
+	snd_pcm_state_t state;
 	
 	for (channel = 0; channel < io->channels; channel++) {
-		jack->areas[channel].addr = 
+		jack->jack_areas[channel].addr =
 			jack_port_get_buffer (jack->ports[channel], nframes);
-		jack->areas[channel].first = 0;
-		jack->areas[channel].step = jack->sample_bits;
+		jack->jack_areas[channel].first = 0;
+		jack->jack_areas[channel].step = jack->sample_bits;
 	}
-		
-	if (io->state != SND_PCM_STATE_RUNNING) {
+
+	state = ATOMIC_READ(&jack->state);
+	if (state == SND_PCM_STATE_RUNNING ||
+	    state == SND_PCM_STATE_DRAINING) {
+		const snd_pcm_channel_area_t *alsa_areas =
+		                (snd_pcm_channel_area_t*)ATOMIC_READ(&jack->alsa_areas);
+
+		while (xfer < nframes) {
+			snd_pcm_uframes_t frames = nframes - xfer;
+			snd_pcm_uframes_t hw_ptr = ATOMIC_READ(&jack->hw_ptr);
+			snd_pcm_uframes_t offset = hw_ptr % io->buffer_size;
+			snd_pcm_uframes_t cont = io->buffer_size - offset;
+			snd_pcm_uframes_t hw_avail = snd_pcm_jack_hw_avail(io);
+
+			/* stop copying if there is no more data available */
+			if (hw_avail <= 0)
+				break;
+
+			/* split the snd_pcm_area_copy() function into two parts
+			 * if the data to copy passes the buffer wrap around
+			 */
+			if (cont < frames)
+				frames = cont;
+
+			if (hw_avail < frames)
+				frames = hw_avail;
+
+			for (channel = 0; channel < io->channels; channel++) {
+				if (io->stream == SND_PCM_STREAM_PLAYBACK)
+					snd_pcm_area_copy(&jack->jack_areas[channel], xfer, &alsa_areas[channel], offset, frames, io->format);
+				else
+					snd_pcm_area_copy(&alsa_areas[channel], offset, &jack->jack_areas[channel], xfer, frames, io->format);
+			}
+
+			hw_ptr += frames;
+			if (hw_ptr >= jack->boundary)
+				hw_ptr -= jack->boundary;
+			ATOMIC_WRITE(&jack->hw_ptr, hw_ptr);
+			xfer += frames;
+		}
+	}
+
+	/* check if requested frames were copied */
+	if (xfer < nframes) {
+		/* always fill the not yet written JACK buffer with silence */
 		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+			const unsigned int samples = nframes - xfer;
 			for (channel = 0; channel < io->channels; channel++)
-				snd_pcm_area_silence(&jack->areas[channel], 0, nframes, io->format);
+				snd_pcm_area_silence(&jack->jack_areas[channel], xfer, samples, io->format);
+		}
+
+		if (state == SND_PCM_STATE_PREPARED) {
+			/* After activating this JACK client with
+			 * jack_activate() this process callback will be called.
+			 * But the processing of snd_pcm_jack_start() would take
+			 * a while longer due to the jack_connect() calls.
+			 * Therefore the device was already started
+			 * but it is not yet in RUNNING state.
+			 * Due to this expected behaviour it is not a Xrun.
+			 */
+		} else if (state == SND_PCM_STATE_DRAINING) {
+			/* If the remaining data in the audio buffer is smaller
+			 * than the requested amount of frames
+			 * we want to provide silence to JACK.
+			 * Therefore this is also not an under run.
+			 */
+		} else {
+			SNDERR("XRUN: JACK requests/provides %u frames but only %u frames were available in the ALSA buffer. (hw %u app %u)",
+			       nframes, xfer, jack->hw_ptr, jack->appl_ptr);
+			ATOMIC_WRITE(&jack->xrun_detected, false);
 			return 0;
 		}
-	}
-	
-	areas = snd_pcm_ioplug_mmap_areas(io);
-
-	while (xfer < nframes) {
-		snd_pcm_uframes_t frames = nframes - xfer;
-		snd_pcm_uframes_t offset = jack->hw_ptr;
-		snd_pcm_uframes_t cont = io->buffer_size - offset;
-
-		if (cont < frames)
-			frames = cont;
-
-		for (channel = 0; channel < io->channels; channel++) {
-			if (io->stream == SND_PCM_STREAM_PLAYBACK)
-				snd_pcm_area_copy(&jack->areas[channel], xfer, &areas[channel], offset, frames, io->format);
-			else
-				snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
-		}
-		
-		jack->hw_ptr += frames;
-		jack->hw_ptr %= io->buffer_size;
-		xfer += frames;
 	}
 
 	pcm_poll_unblock_check(io); /* unblock socket for polling if needed */
@@ -190,13 +377,17 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 	snd_pcm_sw_params_t *swparams;
 	int err;
 
-	jack->hw_ptr = 0;
+	ATOMIC_WRITE(&jack->appl_ptr, 0);
+	ATOMIC_WRITE(&jack->hw_ptr, 0);
+	ATOMIC_WRITE(&jack->xrun_detected, false);
 
 	jack->min_avail = io->period_size;
 	snd_pcm_sw_params_alloca(&swparams);
 	err = snd_pcm_sw_params_current(io->pcm, swparams);
 	if (err == 0) {
 		snd_pcm_sw_params_get_avail_min(swparams, &jack->min_avail);
+		/* get boundary for available calulation */
+		snd_pcm_sw_params_get_boundary(swparams, &jack->boundary);
 	}
 
 	/* deactivate jack connections if this is XRUN recovery */
@@ -230,6 +421,9 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 
 	jack_set_process_callback(jack->client,
 				  (JackProcessCallback)snd_pcm_jack_process_cb, io);
+
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_PREPARED);
+
 	return 0;
 }
 
@@ -240,8 +434,6 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 	
 	if (jack_activate (jack->client))
 		return -EIO;
-
-	jack->activated = 1;
 
 	for (i = 0; i < io->channels && i < jack->num_ports; i++) {
 		if (jack->port_names[i]) {
@@ -259,18 +451,84 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 			}
 		}
 	}
+
+	/* Do not change back to running if we are already in draining.
+	 * This can happen when the playback was not yet started
+	 * but the stream will be stopped with snd_pcm_drain()
+	 */
+	if (ATOMIC_READ(&jack->state) != SND_PCM_STATE_DRAINING)
+		ATOMIC_WRITE(&jack->state, SND_PCM_STATE_RUNNING);
 	
+	return 0;
+}
+
+static int snd_pcm_jack_drain(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+	snd_pcm_state_t state;
+	unsigned int retries = MAX_DRAIN_RETRIES;
+	char buf[32];
+
+	/* Immediately stop on capture device.
+	 * snd_pcm_jack_stop() will be automatically called
+	 * by snd_pcm_ioplug_drain()
+	 */
+	if (io->stream == SND_PCM_STREAM_CAPTURE) {
+		return 0;
+	}
+
+	if (snd_pcm_jack_hw_avail(io) <= 0) {
+		/* No data pending. Nothing to drain. */
+		return 0;
+	}
+
+	/* FIXME: io->state will not be set to SND_PCM_STATE_DRAINING by the
+	 * ALSA library before calling this function.
+	 * Therefore this state has to be stored internally.
+	 */
+	state = ATOMIC_READ(&jack->state);
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_DRAINING);
+
+	/* start device if not yet done */
+	if (state != SND_PCM_STATE_RUNNING) {
+		snd_pcm_jack_start(io);
+	}
+
+	struct pollfd pfd;
+	pfd.fd = io->poll_fd;
+	pfd.events = io->poll_events | POLLERR | POLLNVAL;
+
+	while (snd_pcm_jack_hw_avail(io) > 0) {
+		if (retries <= 0) {
+			SNDERR("Pending frames not yet processed.");
+			return -ETIMEDOUT;
+		}
+
+		if (poll(&pfd, 1, DRAIN_TIMEOUT) < 0) {
+			SNDERR("Waiting for next JACK process callback failed (err %d)",
+			       -errno);
+			return -errno;
+		}
+
+		/* clean pending events. */
+		while (read(io->poll_fd, &buf, sizeof(buf)) == sizeof(buf))
+			;
+	}
+
 	return 0;
 }
 
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
-	
-	if (jack->activated) {
+	const snd_pcm_state_t state = ATOMIC_READ(&jack->state);
+
+	if (state == SND_PCM_STATE_RUNNING ||
+	    state == SND_PCM_STATE_DRAINING) {
 		jack_deactivate(jack->client);
-		jack->activated = 0;
 	}
+
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_SETUP);
 #if 0
 	unsigned i;
 	for (i = 0; i < io->channels; i++) {
@@ -288,7 +546,9 @@ static snd_pcm_ioplug_callback_t jack_pcm_callback = {
 	.start = snd_pcm_jack_start,
 	.stop = snd_pcm_jack_stop,
 	.pointer = snd_pcm_jack_pointer,
+	.transfer = snd_pcm_jack_transfer,
 	.prepare = snd_pcm_jack_prepare,
+	.drain = snd_pcm_jack_drain,
 	.poll_revents = snd_pcm_jack_poll_revents,
 };
 
@@ -391,6 +651,7 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 
 	jack->fd = -1;
 	jack->io.poll_fd = -1;
+	ATOMIC_WRITE(&jack->state, SND_PCM_STATE_OPEN);
 
 	err = parse_ports(jack, stream == SND_PCM_STREAM_PLAYBACK ?
 			  playback_conf : capture_conf);
@@ -428,8 +689,8 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 		return -ENOENT;
 	}
 
-	jack->areas = calloc(jack->channels, sizeof(snd_pcm_channel_area_t));
-	if (! jack->areas) {
+	jack->jack_areas = calloc(jack->channels, sizeof(snd_pcm_channel_area_t));
+	if (! jack->jack_areas) {
 		snd_pcm_jack_free(jack);
 		return -ENOMEM;
 	}
