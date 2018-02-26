@@ -28,6 +28,17 @@
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
 
+/* ALSA supports up to 64 periods per buffer.
+ * Therefore at least 64 retries are valid and
+ * should not be handled as an error case
+ */
+#define MAX_DRAIN_RETRIES	100
+/* ALSA supports a a period with 8192 frames.
+ * This would result in ~170ms at 48kHz.
+ * Therefore a time out of 1 second is sufficient
+ */
+#define DRAIN_TIMEOUT		1000
+
 typedef enum _jack_format {
 	SND_PCM_JACK_FORMAT_RAW
 } snd_pcm_jack_format_t;
@@ -36,7 +47,11 @@ typedef struct {
 	snd_pcm_ioplug_t io;
 
 	int fd;
-	int activated;		/* jack is activated? */
+
+	/* This variable is not always in sync with io->state
+	 * because it will be accessed by multiple threads.
+	 */
+	snd_pcm_state_t state;
 
 	char **port_names;
 	unsigned int num_ports;
@@ -54,14 +69,76 @@ typedef struct {
 
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io);
 
+
+static inline snd_pcm_uframes_t snd_pcm_jack_playback_avail(const snd_pcm_ioplug_t* const io,
+                                                            const snd_pcm_uframes_t hw_ptr,
+                                                            const snd_pcm_uframes_t appl_ptr)
+{
+	const snd_pcm_jack_t* const jack = io->private_data;
+
+	/* cannot use io->hw_ptr without calling snd_pcm_avail_update()
+	 * because it is not guranteed that snd_pcm_jack_pointer() was already
+	 * called
+	 */
+	snd_pcm_sframes_t avail;
+	avail = hw_ptr + io->buffer_size - appl_ptr;
+	if (avail < 0)
+		avail += jack->boundary;
+	else if ((snd_pcm_uframes_t) avail >= jack->boundary)
+		avail -= jack->boundary;
+	return avail;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_capture_avail(const snd_pcm_ioplug_t* const io,
+                                                           const snd_pcm_uframes_t hw_ptr,
+                                                           const snd_pcm_uframes_t appl_ptr)
+{
+	const snd_pcm_jack_t* const jack = io->private_data;
+
+	/* cannot use io->hw_ptr without calling snd_pcm_avail_update()
+	 * because it is not guranteed that snd_pcm_jack_pointer() was already
+	 * called
+	 */
+	snd_pcm_sframes_t avail;
+	avail = hw_ptr - appl_ptr;
+	if (avail < 0)
+		avail += jack->boundary;
+	return avail;
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_avail(const snd_pcm_ioplug_t* const io,
+                                                   const snd_pcm_uframes_t hw_ptr,
+                                                   const snd_pcm_uframes_t appl_ptr)
+{
+	return (io->stream == SND_PCM_STREAM_PLAYBACK) ?
+	                        snd_pcm_jack_playback_avail(io, hw_ptr, appl_ptr) :
+	                        snd_pcm_jack_capture_avail(io, hw_ptr, appl_ptr);
+}
+
+static inline snd_pcm_uframes_t snd_pcm_jack_hw_avail(const snd_pcm_ioplug_t* const io,
+                                                      const snd_pcm_uframes_t hw_ptr,
+                                                      const snd_pcm_uframes_t appl_ptr)
+{
+	/* available data/space which can be transfered by the user application */
+	const snd_pcm_uframes_t user_avail = snd_pcm_jack_avail(io, hw_ptr,
+	                                                        appl_ptr);
+
+	if (user_avail > io->buffer_size) {
+		/* there was an Xrun */
+		return 0;
+	}
+	/* available data/space which can be transfered by the DMA */
+	return io->buffer_size - user_avail;
+}
+
 static int pcm_poll_block_check(snd_pcm_ioplug_t *io)
 {
 	static char buf[32];
 	snd_pcm_sframes_t avail;
 	snd_pcm_jack_t *jack = io->private_data;
 
-	if (io->state == SND_PCM_STATE_RUNNING ||
-	    (io->state == SND_PCM_STATE_PREPARED && io->stream == SND_PCM_STREAM_CAPTURE)) {
+	if (jack->state == SND_PCM_STATE_RUNNING ||
+	    (jack->state == SND_PCM_STATE_PREPARED && io->stream == SND_PCM_STREAM_CAPTURE)) {
 		avail = snd_pcm_avail_update(io->pcm);
 		if (avail >= 0 && avail < jack->min_avail) {
 			while (read(io->poll_fd, &buf, sizeof(buf)) == sizeof(buf))
@@ -80,7 +157,13 @@ static int pcm_poll_unblock_check(snd_pcm_ioplug_t *io)
 	snd_pcm_jack_t *jack = io->private_data;
 
 	avail = snd_pcm_avail_update(io->pcm);
-	if (avail < 0 || avail >= jack->min_avail) {
+	/* In draining state poll_fd is used to wait
+	 * till all pending frames are played.
+	 * Therefore it has to be guarantee that a poll event is also generated
+	 * if the buffer contains less than min_avail frames
+	 */
+	if (avail < 0 || avail >= jack->min_avail ||
+	    jack->state == SND_PCM_STATE_DRAINING) {
 		write(jack->fd, &buf, 1);
 		return 1;
 	}
@@ -132,6 +215,17 @@ static snd_pcm_sframes_t snd_pcm_jack_pointer(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
 
+#ifdef TEST_SIMULATE_XRUNS
+	static int i=0;
+	if (++i > 1000) {
+		i = 0;
+		return -EPIPE;
+	}
+#endif
+
+	if (jack->state == SND_PCM_STATE_XRUN)
+		return -EPIPE;
+
 #ifdef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
 	return jack->hw_ptr;
 #else
@@ -144,7 +238,6 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
 	snd_pcm_uframes_t hw_ptr;
-	const snd_pcm_channel_area_t *areas;
 	snd_pcm_uframes_t xfer = 0;
 	unsigned int channel;
 	
@@ -154,39 +247,76 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		jack->areas[channel].first = 0;
 		jack->areas[channel].step = jack->sample_bits;
 	}
-		
-	if (io->state != SND_PCM_STATE_RUNNING) {
-		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
-			for (channel = 0; channel < io->channels; channel++)
-				snd_pcm_area_silence(&jack->areas[channel], 0, nframes, io->format);
-			return 0;
-		}
-	}
 
 	hw_ptr = jack->hw_ptr;
-	areas = snd_pcm_ioplug_mmap_areas(io);
+	if (jack->state == SND_PCM_STATE_RUNNING ||
+	    jack->state == SND_PCM_STATE_DRAINING) {
+		const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
 
-	while (xfer < nframes) {
-		snd_pcm_uframes_t frames = nframes - xfer;
-		snd_pcm_uframes_t offset = hw_ptr % io->buffer_size;
-		snd_pcm_uframes_t cont = io->buffer_size - offset;
+		while (xfer < nframes) {
+			snd_pcm_uframes_t frames = nframes - xfer;
+			snd_pcm_uframes_t offset = hw_ptr % io->buffer_size;
+			snd_pcm_uframes_t cont = io->buffer_size - offset;
+			snd_pcm_uframes_t hw_avail =
+			                snd_pcm_jack_hw_avail(io, hw_ptr,
+			                                      io->appl_ptr);
 
-		if (cont < frames)
-			frames = cont;
+			/* stop copying if there is no more data available */
+			if (hw_avail <= 0)
+				break;
 
-		for (channel = 0; channel < io->channels; channel++) {
-			if (io->stream == SND_PCM_STREAM_PLAYBACK)
-				snd_pcm_area_copy(&jack->areas[channel], xfer, &areas[channel], offset, frames, io->format);
-			else
-				snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
+			/* split the snd_pcm_area_copy() function into two parts
+			 * if the data to copy passes the buffer wrap around
+			 */
+			if (cont < frames)
+				frames = cont;
+
+			if (hw_avail < frames)
+				frames = hw_avail;
+
+			for (channel = 0; channel < io->channels; channel++) {
+				if (io->stream == SND_PCM_STREAM_PLAYBACK)
+					snd_pcm_area_copy(&jack->areas[channel], xfer, &areas[channel], offset, frames, io->format);
+				else
+					snd_pcm_area_copy(&areas[channel], offset, &jack->areas[channel], xfer, frames, io->format);
+			}
+
+			hw_ptr += frames;
+			if (hw_ptr >= jack->boundary)
+				hw_ptr -= jack->boundary;
+			xfer += frames;
 		}
-		
-		hw_ptr += frames;
-		if (hw_ptr >= jack->boundary)
-			hw_ptr -= jack->boundary;
-		xfer += frames;
 	}
 	jack->hw_ptr = hw_ptr;
+
+	/* check if requested frames were copied */
+	if (xfer < nframes) {
+		/* always fill the not yet written JACK buffer with silence */
+		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
+			const snd_pcm_uframes_t samples = nframes - xfer;
+			for (channel = 0; channel < io->channels; channel++)
+				snd_pcm_area_silence(&jack->areas[channel], xfer, samples, io->format);
+		}
+
+		if (io->stream == SND_PCM_STREAM_PLAYBACK &&
+		    jack->state == SND_PCM_STATE_PREPARED) {
+			/* After activating this JACK client with
+			 * jack_activate() this process callback will be called.
+			 * But the processing of snd_pcm_jack_start() would take
+			 * a while longer due to the jack_connect() calls.
+			 * Therefore the device was already started
+			 * but it is not yet in RUNNING state.
+			 * Due to this expected behaviour it is not an under run.
+			 * In Capture use case the buffer should be filled
+			 * and if the application is not fast enough
+			 * to read the data in the buffer
+			 * it is a valid over run.
+			 */
+		} else {
+			/* report Xrun to user application */
+			jack->state = SND_PCM_STATE_XRUN;
+		}
+	}
 
 	pcm_poll_unblock_check(io); /* unblock socket for polling if needed */
 
@@ -219,29 +349,31 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 	else
 		pcm_poll_block_check(io); /* block capture pcm if that's XRUN recovery */
 
-	if (jack->ports)
-		return 0;
+	if (!jack->ports) {
+		jack->ports = calloc(io->channels, sizeof(jack_port_t*));
 
-	jack->ports = calloc(io->channels, sizeof(jack_port_t*));
+		for (i = 0; i < io->channels; i++) {
+			char port_name[32];
+			if (io->stream == SND_PCM_STREAM_PLAYBACK) {
 
-	for (i = 0; i < io->channels; i++) {
-		char port_name[32];
-		if (io->stream == SND_PCM_STREAM_PLAYBACK) {
-
-			sprintf(port_name, "out_%03d", i);
-			jack->ports[i] = jack_port_register(jack->client, port_name,
-							    JACK_DEFAULT_AUDIO_TYPE,
-							    JackPortIsOutput, 0);
-		} else {
-			sprintf(port_name, "in_%03d", i);
-			jack->ports[i] = jack_port_register(jack->client, port_name,
-							    JACK_DEFAULT_AUDIO_TYPE,
-							    JackPortIsInput, 0);
+				sprintf(port_name, "out_%03d", i);
+				jack->ports[i] = jack_port_register(jack->client, port_name,
+								    JACK_DEFAULT_AUDIO_TYPE,
+								    JackPortIsOutput, 0);
+			} else {
+				sprintf(port_name, "in_%03d", i);
+				jack->ports[i] = jack_port_register(jack->client, port_name,
+								    JACK_DEFAULT_AUDIO_TYPE,
+								    JackPortIsInput, 0);
+			}
 		}
+
+		jack_set_process_callback(jack->client,
+					  (JackProcessCallback)snd_pcm_jack_process_cb, io);
 	}
 
-	jack_set_process_callback(jack->client,
-				  (JackProcessCallback)snd_pcm_jack_process_cb, io);
+	jack->state = SND_PCM_STATE_PREPARED;
+
 	return 0;
 }
 
@@ -249,11 +381,10 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
 	unsigned int i;
+	int err = 0;
 	
 	if (jack_activate (jack->client))
 		return -EIO;
-
-	jack->activated = 1;
 
 	for (i = 0; i < io->channels && i < jack->num_ports; i++) {
 		if (jack->port_names[i]) {
@@ -267,21 +398,82 @@ static int snd_pcm_jack_start(snd_pcm_ioplug_t *io)
 			}
 			if (jack_connect(jack->client, src, dst)) {
 				fprintf(stderr, "cannot connect %s to %s\n", src, dst);
-				return -EIO;
+				err = -EIO;
+				break;
 			}
 		}
 	}
+
+	/* do not start forwarding audio samples before the ports are connected */
+	jack->state = SND_PCM_STATE_RUNNING;
 	
+	return err;
+}
+
+static int snd_pcm_jack_drain(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_jack_t *jack = io->private_data;
+	const snd_pcm_state_t state = jack->state;
+	unsigned int retries = MAX_DRAIN_RETRIES;
+	char buf[32];
+
+	/* Immediately stop on capture device.
+	 * snd_pcm_jack_stop() will be automatically called
+	 * by snd_pcm_ioplug_drain()
+	 */
+	if (io->stream == SND_PCM_STREAM_CAPTURE) {
+		return 0;
+	}
+
+	if (snd_pcm_jack_hw_avail(io, jack->hw_ptr, io->appl_ptr) <= 0) {
+		/* No data pending. Nothing to drain. */
+		return 0;
+	}
+
+	/* start device if not yet done */
+	if (state == SND_PCM_STATE_PREPARED) {
+		snd_pcm_jack_start(io);
+	}
+
+	/* FIXME: io->state will not be set to SND_PCM_STATE_DRAINING by the
+	 * ALSA library before calling this function.
+	 * Therefore this state has to be stored internally.
+	 */
+	jack->state = SND_PCM_STATE_DRAINING;
+
+	struct pollfd pfd;
+	pfd.fd = io->poll_fd;
+	pfd.events = io->poll_events | POLLERR | POLLNVAL;
+
+	while (snd_pcm_jack_hw_avail(io, jack->hw_ptr, io->appl_ptr) > 0) {
+		if (retries <= 0) {
+			SNDERR("Pending frames not yet processed.");
+			return -ETIMEDOUT;
+		}
+
+		if (poll(&pfd, 1, DRAIN_TIMEOUT) < 0) {
+			SNDERR("Waiting for next JACK process callback failed (err %d)",
+			       -errno);
+			return -errno;
+		}
+
+		/* clean pending events. */
+		while (read(io->poll_fd, &buf, sizeof(buf)) == sizeof(buf))
+			;
+	}
+
 	return 0;
 }
 
 static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
-	
-	if (jack->activated) {
+	const snd_pcm_state_t state = jack->state;
+
+	if (state == SND_PCM_STATE_RUNNING ||
+	    state == SND_PCM_STATE_DRAINING ||
+	    state == SND_PCM_STATE_XRUN) {
 		jack_deactivate(jack->client);
-		jack->activated = 0;
 	}
 #if 0
 	unsigned i;
@@ -292,6 +484,9 @@ static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io)
 		}
 	}
 #endif
+
+	jack->state = SND_PCM_STATE_SETUP;
+
 	return 0;
 }
 
@@ -301,6 +496,7 @@ static snd_pcm_ioplug_callback_t jack_pcm_callback = {
 	.stop = snd_pcm_jack_stop,
 	.pointer = snd_pcm_jack_pointer,
 	.prepare = snd_pcm_jack_prepare,
+	.drain = snd_pcm_jack_drain,
 	.poll_revents = snd_pcm_jack_poll_revents,
 };
 
@@ -403,6 +599,7 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 
 	jack->fd = -1;
 	jack->io.poll_fd = -1;
+	jack->state = SND_PCM_STATE_OPEN;
 
 	err = parse_ports(jack, stream == SND_PCM_STREAM_PLAYBACK ?
 			  playback_conf : capture_conf);
